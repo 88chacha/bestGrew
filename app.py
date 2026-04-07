@@ -55,9 +55,10 @@ def quest_val(val, is_main=False):
         try:               return float(v)
         except:            return 0.0
     else:
-        # 일반 QUEST: P=1, F=0, null/미제출=0
+        # 일반 QUEST: P=1, 숫자(A타입)=그대로, F/null/미제출=0
         if v == "P":       return 1.0
-        return 0.0
+        try:               return float(v)   # QUEST (A) 타입 등 숫자 점수
+        except:            return 0.0
 
 def normalize_series(s):
     mn, mx = s.min(), s.max()
@@ -127,8 +128,22 @@ def load_data():
         h1 = rows[0]
         h2 = rows[1] if len(rows) > 1 else []
 
-        def find_col(keyword):
-            for i, h in enumerate(h1):
+        # 역전 헤더 감지: 행0에 '이름'이 없고 행1에 있으면 구조가 역전된 시트
+        # 예) 12기리서치 이후: 행0=퀘스트컬럼, 행1=학습자정보컬럼+날짜
+        inverted = (not any("이름" in str(x) for x in h1) and
+                    any("이름" in str(x) for x in h2))
+        if inverted:
+            info_header  = h2   # 학습자 정보 컬럼 (이름, 과정, 상태 등)
+            quest_header = h1   # 퀘스트 컬럼명
+            data_start   = 2    # 데이터는 항상 3행(index 2)부터
+        else:
+            info_header  = h1
+            quest_header = h1
+            has_date_row = h2 and any(str(v).startswith("20") for v in h2 if v)
+            data_start   = 2 if has_date_row else 1
+
+        def find_col(keyword, header=info_header):
+            for i, h in enumerate(header):
                 if keyword in str(h):
                     return i
             return None
@@ -136,9 +151,19 @@ def load_data():
         uid_col    = find_col("고유번호")
         name_col   = find_col("이름")
         course_col = find_col("과정")
-        status_col = find_col("상태") or find_col("훈련상태")
+        # status_col: index가 0일 수 있으므로 None 체크
+        status_col = find_col("훈련상태")
+        if status_col is None:
+            status_col = find_col("상태")
 
-        irr_cols = {k: find_col(k) for k in IRREGULAR_KEYS if find_col(k) is not None}
+        # 비정규 컬럼: 역전 시트는 quest_header(행0)에 있으므로 별도 탐색
+        def find_col_in(keyword, header):
+            for i, h in enumerate(header):
+                if keyword in str(h):
+                    return i
+            return None
+        irr_cols = {k: find_col_in(k, quest_header) for k in IRREGULAR_KEYS
+                    if find_col_in(k, quest_header) is not None}
 
         def is_main_quest(h):
             h = str(h)
@@ -148,15 +173,10 @@ def load_data():
             h = str(h)
             if is_main_quest(h):
                 return False
-            # QUEST_XX, QUEST_XX (A/B/C), Sub Quest XX, QuestB_XX 등 모두 포함
             return ("QUEST" in h.upper() or "Sub Quest" in h or "QuestB" in h)
 
-        quest_cols      = [i for i, h in enumerate(h1) if is_regular_quest(h)]
-        main_quest_cols = [i for i, h in enumerate(h1) if is_main_quest(h)]
-
-        # 날짜 행 감지: h2 전체에서 "20"으로 시작하는 값이 있으면 날짜 행으로 판단
-        has_date_row = h2 and any(str(v).startswith("20") for v in h2 if v)
-        data_start = 2 if has_date_row else 1
+        quest_cols      = [i for i, h in enumerate(quest_header) if is_regular_quest(h)]
+        main_quest_cols = [i for i, h in enumerate(quest_header) if is_main_quest(h)]
 
         for row in rows[data_start:]:
             if not row:
