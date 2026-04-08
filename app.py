@@ -42,6 +42,22 @@ def read_sheet(service, sheet_name):
     ).execute()
     return result.get("values", [])
 
+def batch_read_sheets(service, sheet_names):
+    """여러 시트를 batchGet으로 한 번에 조회 — API 호출 횟수 최소화"""
+    if not sheet_names:
+        return {}
+    result = service.spreadsheets().values().batchGet(
+        spreadsheetId=SPREADSHEET_ID,
+        ranges=sheet_names,
+    ).execute()
+    out = {}
+    for vr in result.get("valueRanges", []):
+        # range 값 예: "'퀘스트(7기코어)'!A1:ZZ999" → 시트명 추출
+        raw_range = vr.get("range", "")
+        sname = raw_range.split("!")[0].strip("'")
+        out[sname] = vr.get("values", [])
+    return out
+
 def to_num(val, default=0):
     try:
         return float(str(val).replace(",", "").strip())
@@ -69,7 +85,7 @@ def normalize_series(s):
 # ─────────────────────────────────────────
 # 데이터 로딩
 # ─────────────────────────────────────────
-@st.cache_data(ttl=300, show_spinner="스프레드시트 데이터 불러오는 중...")
+@st.cache_data(ttl=1800, show_spinner="스프레드시트 데이터 불러오는 중...")
 def load_data():
     service = get_service()
     meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
@@ -117,11 +133,12 @@ def load_data():
             if node_submitted:
                 star_map[key]["노드제출"].add(node_name)
 
-    # 퀘스트 시트 순회
+    # 퀘스트 시트 일괄 조회 (batchGet — API 호출 1회)
     records = []
     import re
+    all_quest_data = batch_read_sheets(service, quest_sheets)
     for sheet_name in quest_sheets:
-        rows = read_sheet(service, sheet_name)
+        rows = all_quest_data.get(sheet_name, [])
         if len(rows) < 2:
             continue
 
@@ -290,6 +307,7 @@ MAX_SCORES = {
     ("리서치", "14기"):     (48, 89),
     ("리서치", "15기"):     (48, 89),
     ("리서치", "16기"):     (54, 89),
+    ("엔지니어", "1기"):    (24, 85),
     ("DS",     "데싸1기"):  (69, 89),
     ("DS",     "데싸2기"):  (45, 89),
     ("DS",     "데싸3기"):  (36, 88),
@@ -332,8 +350,11 @@ def compute_scores(df, w_quest, w_star, w_irr, w_sincerity):
             grp["퀘스트_정규화"] = normalize_series(grp["퀘스트합계"])
             grp["별점_정규화"]   = normalize_series(grp["노드별점"])
 
-        # 비정규: 그룹 내 Min-Max
-        grp["비정규_정규화"] = normalize_series(grp["비정규합계"])
+        # 비정규: IQR 적응형 윈저라이징 후 Min-Max (이상치 없으면 clip 무효)
+        q3  = grp["비정규합계"].quantile(0.75)
+        iqr = q3 - grp["비정규합계"].quantile(0.25)
+        irr_cap = q3 + 1.5 * iqr
+        grp["비정규_정규화"] = normalize_series(grp["비정규합계"].clip(upper=irr_cap))
         # 성실점수: 이미 0~100 비율이므로 정규화 없이 그대로 사용
         grp["성실_정규화"] = grp["성실점수"].clip(0, 100)
 
@@ -362,10 +383,10 @@ if df_all.empty:
 
 # ── 사이드바 ──────────────────────────────
 st.sidebar.header("점수 반영 비율")
-w_quest     = st.sidebar.slider("퀘스트 점수 (QUEST + Main QUEST)", 0, 100, 40, step=5)
-w_star      = st.sidebar.slider("노드 별점", 0, 100, 25, step=5)
-w_irr       = st.sidebar.slider("비정규 점수", 0, 100, 15, step=5)
-w_sincerity = st.sidebar.slider("성실 점수 (퀘스트+노드 제출율 평균)", 0, 100, 20, step=5)
+w_quest     = st.sidebar.slider("퀘스트 점수 (QUEST + Main QUEST)", 0, 100, 50, step=5)
+w_star      = st.sidebar.slider("노드 별점", 0, 100, 20, step=5)
+w_irr       = st.sidebar.slider("비정규 점수", 0, 100, 20, step=5)
+w_sincerity = st.sidebar.slider("성실 점수 (퀘스트+노드 제출율 평균)", 0, 100, 10, step=5)
 
 total_w = w_quest + w_star + w_irr + w_sincerity
 if total_w == 0:
@@ -395,7 +416,7 @@ df = compute_scores(df, w_quest, w_star, w_irr, w_sincerity)
 
 st.sidebar.divider()
 st.sidebar.header("우수수료생 기준")
-cutoff_score = st.sidebar.slider("기준 점수 (0~100)", 0.0, 100.0, 70.0, step=0.5)
+cutoff_score = st.sidebar.slider("기준 점수 (0~100)", 0.0, 100.0, 80.0, step=1)
 st.sidebar.caption("과정+기수 내 Min-Max 정규화(0~100) 후 가중합산한 종합점수 기준")
 
 df["우수수료생"] = df["종합점수"] >= cutoff_score
@@ -456,15 +477,23 @@ with tab1:
                     st.metric("기준 점수", f"{cutoff_score:.1f}")
 
                 with col_b:
-                    # 막대 차트 (종합점수)
+                    # 막대 차트 (종합점수) — 추가 추천 포함
+                    min_15pct_chart = max(1, int(n_total * 0.15))
+                    top15_names = set(grp.head(min_15pct_chart)["이름"]) if n_exc < min_15pct_chart else set()
                     chart_df = grp[["이름", "종합점수", "우수수료생"]].copy()
-                    chart_df["구분"] = chart_df["우수수료생"].map({True: "우수수료생", False: "일반"})
+                    def _label(row):
+                        if row["우수수료생"]:
+                            return "우수수료생"
+                        if row["이름"] in top15_names:
+                            return "추가 추천"
+                        return "일반"
+                    chart_df["구분"] = chart_df.apply(_label, axis=1)
                     bar = alt.Chart(chart_df).mark_bar().encode(
                         x=alt.X("종합점수:Q", scale=alt.Scale(domain=[0, 100])),
                         y=alt.Y("이름:N", sort="-x"),
                         color=alt.Color("구분:N",
-                            scale=alt.Scale(domain=["우수수료생", "일반"],
-                                            range=["#2ecc71", "#bdc3c7"])),
+                            scale=alt.Scale(domain=["우수수료생", "추가 추천", "일반"],
+                                            range=["#2ecc71", "#f0c040", "#bdc3c7"])),
                         tooltip=["이름", "종합점수", "구분"]
                     ).properties(height=max(80, n_total * 25))
                     cutline = alt.Chart(pd.DataFrame({"x": [cutoff_score]})).mark_rule(
@@ -511,6 +540,43 @@ with tab1:
                             )
                 else:
                     st.info("기준 점수를 넘은 학습자가 없습니다.")
+
+                # ── 상위 15% 추가 추천 ──
+                min_15pct = max(1, int(n_total * 0.15))
+                if n_total > 0 and n_exc < min_15pct:
+                    top10 = grp.head(min_15pct)
+                    extra = top10[~top10["우수수료생"]]
+                    if not extra.empty:
+                        st.markdown(
+                            f"⚠️ **추가 추천**: 우수수료생이 전체의 "
+                            f"{n_exc/n_total*100:.1f}%로 15% 미만입니다. "
+                            f"종합점수 상위 15% ({min_15pct}명) 중 미선정 "
+                            f"{len(extra)}명을 추천합니다."
+                        )
+                        extra_disp = extra[["이름", "훈련상태",
+                                            "퀘스트합계",  "퀘스트_정규화",
+                                            "노드별점",    "별점_정규화",
+                                            "비정규합계",  "비정규_정규화",
+                                            "퀘스트제출율", "노드제출율", "성실_정규화",
+                                            "종합점수"]].reset_index(drop=True)
+                        extra_disp.columns = ["이름", "훈련상태",
+                                              "퀘스트(원점수)", "퀘스트(정규화)",
+                                              "별점(원점수)",   "별점(정규화)",
+                                              "비정규(원점수)", "비정규(정규화)",
+                                              "퀘스트제출율(%)", "노드제출율(%)", "성실(정규화)",
+                                              "종합점수"]
+                        italic_cols2 = ["퀘스트(정규화)", "별점(정규화)", "비정규(정규화)", "성실(정규화)"]
+                        st.dataframe(
+                            extra_disp.style.format({
+                                "퀘스트(원점수)":  "{:.1f}", "퀘스트(정규화)":  "{:.1f}",
+                                "별점(원점수)":    "{:.1f}", "별점(정규화)":    "{:.1f}",
+                                "비정규(원점수)":  "{:.1f}", "비정규(정규화)":  "{:.1f}",
+                                "퀘스트제출율(%)": "{:.1f}", "노드제출율(%)":   "{:.1f}",
+                                "성실(정규화)":    "{:.1f}", "종합점수":        "{:.2f}",
+                            }).map(lambda _: "background-color:#fff3cd", subset=["종합점수"])
+                             .map(lambda _: "color:#666666; font-style:italic", subset=italic_cols2),
+                            use_container_width=True,
+                        )
 
 # ────────────────────────────────────────
 # TAB 2 : 전체 순위표
