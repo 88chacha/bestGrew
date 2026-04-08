@@ -416,7 +416,7 @@ df = compute_scores(df, w_quest, w_star, w_irr, w_sincerity)
 
 st.sidebar.divider()
 st.sidebar.header("우수수료생 기준")
-cutoff_score = st.sidebar.slider("기준 점수 (0~100)", 0.0, 100.0, 80.0, step=1)
+cutoff_score = st.sidebar.slider("기준 점수 (0~100)", 0.0, 100.0, 80.0, step=1.0)
 st.sidebar.caption("과정+기수 내 Min-Max 정규화(0~100) 후 가중합산한 종합점수 기준")
 
 df["우수수료생"] = df["종합점수"] >= cutoff_score

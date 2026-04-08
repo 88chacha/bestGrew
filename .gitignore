@@ -3,3 +3,4 @@
 __pycache__/
 .env
 .streamlit/secrets.toml
+우수수료생_선징기준_안내.md
